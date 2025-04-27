@@ -1,0 +1,1124 @@
+Here i will provide you some code samples and documents object of the genAI SDK of gemini (google) that we are going to use as the AI workflow, i am using this because i have already worked on it created various discord AI bots and the model that i am going to use in this project is very good and powerfull for this, these code samples are just the parts from the other projects like some from my discord bot, docs and all so we will have to modify these as per out project requirements code:
+
+
+here is the code snippet of uploading, validating attachments/media files so that the gemini models can use those files directly, this code is from my AI discord bot that is multimodel
+
+# Function to upload attachments to Gemini
+def upload_to_gemini(file_path):
+    """
+    Upload a file to Gemini using the new API method that requires a 'file'
+    parameter instead of 'path' and does not use mime_type.
+    """
+    # The new API expects: client.files.upload(file='your_file.txt')
+    return client.files.upload(file=file_path)
+
+# Function to wait for files to be active
+async def wait_for_files_active(files):
+    for file in files:
+        while True:
+            file_status = await asyncio.to_thread(
+                lambda: client.files.get(name=file.name).state.name
+            )
+            if file_status == "ACTIVE":
+                break
+            elif file_status == "PROCESSING":
+                await asyncio.sleep(5)
+            else:
+                raise Exception(f"File {file.name} failed to process")
+
+
+# Function to validate files before query
+async def validate_files_before_query(files):
+    valid_files = []
+    for file in files:
+        if file.uri in uploaded_files:
+            valid_files.append(file)
+        else:
+            print(f"Skipping invalid or inaccessible file: {file.uri}")
+            remove_file_references_immediately(
+                file.uri
+            )  # Remove references immediately
+    return valid_files
+
+
+async def handle_attachment(attachment, delete_after_seconds=86400):
+    """
+    Process an incoming attachment, upload it to Gemini using the new API,
+    and schedule its deletion.
+    """
+    try:
+        # Use check_mime_type to validate the attachment's MIME type.
+        file_type = await check_mime_type(attachment)
+        if file_type is None:
+            print(f"Unsupported file type: {attachment.content_type}")
+            return None
+
+        file_name = attachment.filename  # Use the filename directly
+        file_bytes = await attachment.read()
+
+        # Save the file locally for upload
+        async with aiofiles.open(file_name, "wb") as f:
+            await f.write(file_bytes)
+
+        # Upload the file to Gemini using the new API signature:
+        # Pass the local file path with the keyword argument "file" and do not pass mime_type.
+        file = await asyncio.to_thread(upload_to_gemini, file_name)
+
+        # Remove the local file after uploading to Gemini
+        os.remove(file_name)
+
+        # Store the uploaded file using its URI as the key and schedule deletion.
+        uploaded_files[file.uri] = file
+        asyncio.create_task(delete_file_after_delay(file.uri, delete_after_seconds))
+
+        return file
+
+    except Exception as ex:
+        print(f"Error handling attachment: {ex}")
+        return None
+
+
+# Function to delete a file after a delay
+async def delete_file_after_delay(file_uri, delay_seconds):
+    """
+    Wait for delay_seconds and then delete the file from Gemini.
+    """
+    try:
+        # Wait for the specified time before deleting the file.
+        await asyncio.sleep(delay_seconds)
+
+        # Check if the file exists in the uploaded_files dictionary.
+        if file_uri in uploaded_files:
+            file = uploaded_files[file_uri]
+            # Delete the file using the new API delete method:
+            # Pass the file name to the delete() method.
+            client.files.delete(name=file.name)
+            del uploaded_files[file_uri]  # Remove the file from our local store.
+            print(f"File {file_uri} deleted after {delay_seconds} seconds.")
+        else:
+            print(f"File {file_uri} not found or already deleted.")
+
+        # Immediately remove file references from the chat history.
+        remove_file_references_immediately(file_uri)
+
+    except Exception as ex:
+        print(f"Error during file deletion: {ex}")
+
+here is the fucntion code where we are using the media files in the AI chatbot:
+
+async def generate_response_prime(
+    author_id, query, attachments=None, youtube_parts=None
+):
+    author_id = str(author_id)
+
+    # Prime settings
+    max_tokens = 5000  # Maximum output tokens for Prime users
+    history_limit = 50  # Keep last 50 messages in history
+    model_name = "gemini-2.0-flash"  # Prime-specific model
+
+    # Use the separate global dictionary for Prime users
+    global prime_history
+    if author_id not in prime_history:
+        prime_history[author_id] = {
+            "chat": client.chats.create(
+                model=model_name,
+                config=GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=[google_search_tool, youtube_search_tool],
+                    temperature=0.5,
+                    max_output_tokens=max_tokens,
+                    safety_settings=safety_settings,
+                ),
+            ),
+            "history": [],
+        }
+
+    chat = prime_history[author_id]["chat"]
+    history = prime_history[author_id]["history"]
+
+    try:
+        # Process regular file attachments
+        files = []
+        if attachments:
+            files = await asyncio.gather(
+                *(handle_attachment(attachment) for attachment in attachments)
+            )
+            files = [file for file in files if file is not None]
+            # Validate files before query
+            files = await validate_files_before_query(files)
+            # Wait for files to become active
+            if files:
+                await wait_for_files_active(files)
+
+        # Prepare message parts
+        message_parts = []
+
+        # Add file attachments
+        if files:
+            message_parts.extend(files)
+
+        # Add YouTube parts
+        if youtube_parts and len(youtube_parts) > 0:
+            message_parts.extend(youtube_parts)
+
+        # Add the text query
+        message_parts.append(query)
+
+        # Send message with all parts
+        if len(message_parts) <= 1:  # Just the query
+            response = await asyncio.to_thread(chat.send_message, query)
+        else:
+            response = await asyncio.to_thread(chat.send_message, message_parts)
+
+        # Extract text from response
+        text_parts = [
+            part.text
+            for part in response.candidates[0].content.parts
+            if part.text is not None
+        ]
+        response_text = "".join(text_parts)
+
+        # Update history with the latest query and response
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": response_text})
+
+        # Keep only the last `history_limit` messages
+        if len(history) > history_limit:
+            prime_history[author_id]["history"] = history[-history_limit:]
+
+        if response.function_calls and len(response.function_calls) > 0:
+            func_response_parts = []
+            for func_call in response.function_calls:
+                if func_call.name == "google_search":
+                    args = func_call.args
+                    search_query = args.get("query", "")
+                    function_response = await google_search(search_query)
+                    if function_response is None:
+                        function_response = "Error performing internet search."
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="google_search",
+                            response={"content": function_response}
+                        )
+                    )
+                elif func_call.name == "search_youtube_videos":
+                    args = func_call.args
+                    search_query = args.get("query", "")
+                    max_res = args.get("max_results", 3)
+                    function_response = await search_youtube_videos(search_query, max_res)
+                    if function_response is None:
+                        function_response = "Error performing YouTube search."
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="search_youtube_videos",
+                            response={"content": function_response}
+                        )
+                    )
+                else:
+                    continue
+            response = await asyncio.to_thread(chat.send_message, func_response_parts)
+            text_parts = [
+                part.text
+                for part in response.candidates[0].content.parts
+                if part.text is not None
+            ]
+            response_text = "".join(text_parts)
+            history.append({"role": "assistant", "content": response_text})
+        return response_text
+
+    except Exception as ex:
+        print(f"Unhandled exception in Prime Function: {ex}")
+        return "An error occurred, try again later or join our support server."
+
+Now, lets move to the new part that is doing fucntiona calling or tool calling the main thing i will give you three discord bots code for the better understanding like how does it works:
+
+bot 1 :
+
+First we have to Declare some fucntions with the proper description and all and then we have to create powerfull fucntions for the working:
+
+
+google_search_decl = FunctionDeclaration(
+    name="google_search",
+    description="Search the web using Google Search API to get real-time information from the internet.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query for Google search to find real-time information from the internet. This query should reflect what the user is asking for.",
+            }
+        },
+        "required": ["query"],
+    },
+)
+google_search_tool = Tool(function_declarations=[google_search_decl])
+
+# --- YouTube Video Search Tool Definition ---
+youtube_search_decl = FunctionDeclaration(
+    name="search_youtube_videos",
+    description="Searches YouTube for videos based on a query and returns the top results with their titles and URLs.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search term(s) for YouTube video search.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Optional: The maximum number of video results to return (default is 3).",
+            }
+        },
+        "required": ["query"],
+    },
+)
+youtube_search_tool = Tool(function_declarations=[youtube_search_decl])
+
+# --- YouTube Video Search Function ---
+async def search_youtube_videos(query: str, max_results: int = 3) -> str:
+    """
+    Searches YouTube for videos based on a query and returns the top results
+    with their titles and URLs.
+
+    Args:
+        query: The search term(s).
+        max_results: The maximum number of results to return (default 3).
+
+    Returns:
+        A formatted string containing the search results, or an error message.
+    """
+    if not YOUTUBE_API_KEY:
+        logging.error("YOUTUBE_API_KEY is not set. Cannot perform YouTube search.")
+        return "Error: YouTube search is currently unavailable due to configuration issues."
+
+    try:
+        # Build the YouTube API client
+        youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+
+        # Call the search.list method to retrieve results matching the query
+        search_response = await asyncio.to_thread(
+            youtube.search().list(
+                q=query,
+                part='snippet',
+                maxResults=max_results,
+                type='video'  # Ensure we only get videos
+            ).execute
+        )
+
+        results = []
+        for search_result in search_response.get('items', []):
+            video_id = search_result.get('id', {}).get('videoId')
+            title = search_result.get('snippet', {}).get('title')
+            if video_id and title:
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+                results.append(f"Title: {title}\nURL: {video_url}")
+
+        if not results:
+            return f"No relevant YouTube videos found for '{query}'."
+
+        return "\n\n".join(results)
+
+    except HttpError as e:
+        logging.error(f"An HTTP error {e.resp.status} occurred during YouTube search: {e.content}")
+        return f"Error: Could not complete YouTube search due to an API error ({e.resp.status})."
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during YouTube search: {e}", exc_info=True)
+        return "Error: An unexpected error occurred while searching YouTube."
+
+
+async def google_search(query: str) -> str:
+    """
+    Uses Gemini's native Google Search tool to get real-time information.
+    This function is separate from our main chat system and only returns search results.
+    """
+    try:
+        # Create a specific system instruction for the search-only model
+        search_system_prompt = """
+        You are a search tool that provides real time information from the web.
+        - Return ONLY the real time information you find through search
+        - Do NOT add any introductory phrases like "Here's what I found" or "According to my search"
+        - Do NOT add any conclusions or summaries
+        - Format the information in a clear, concise manner
+        - Include relevant dates, numbers, and facts from your search
+        - If you cannot find information, simply state "No relevant information found"
+        """
+        
+        # Use the native Google Search tool
+        google_search_tool = Tool(google_search=GoogleSearch())
+        
+        # Generate content with the search tool
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash",
+            contents=f"Search query: {query}",
+            config=GenerateContentConfig(
+                system_instruction=search_system_prompt,
+                tools=[google_search_tool],
+                temperature=0.1,  
+                safety_settings=safety_settings,
+            )
+        )
+        
+        # Extract the text from the response
+        text_parts = [part.text for part in response.candidates[0].content.parts if part.text]
+        search_result = "".join(text_parts)
+        
+        return search_result.strip()
+    
+    except Exception as e:
+        logger.error(f"Error in native Google search: {e}")
+        return "Error performing internet search. Please try again later."
+
+
+# Function to generate response for Prime users
+async def generate_response_prime(
+    author_id, query, attachments=None, youtube_parts=None
+):
+    author_id = str(author_id)
+
+    # Prime settings
+    max_tokens = 5000  # Maximum output tokens for Prime users
+    history_limit = 50  # Keep last 50 messages in history
+    model_name = "gemini-2.0-flash"  # Prime-specific model
+
+    # Use the separate global dictionary for Prime users
+    global prime_history
+    if author_id not in prime_history:
+        prime_history[author_id] = {
+            "chat": client.chats.create(
+                model=model_name,
+                config=GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=[google_search_tool, youtube_search_tool],
+                    temperature=0.5,
+                    max_output_tokens=max_tokens,
+                    safety_settings=safety_settings,
+                ),
+            ),
+            "history": [],
+        }
+
+    chat = prime_history[author_id]["chat"]
+    history = prime_history[author_id]["history"]
+
+    try:
+        # Process regular file attachments
+        files = []
+        if attachments:
+            files = await asyncio.gather(
+                *(handle_attachment(attachment) for attachment in attachments)
+            )
+            files = [file for file in files if file is not None]
+            # Validate files before query
+            files = await validate_files_before_query(files)
+            # Wait for files to become active
+            if files:
+                await wait_for_files_active(files)
+
+        # Prepare message parts
+        message_parts = []
+
+        # Add file attachments
+        if files:
+            message_parts.extend(files)
+
+        # Add YouTube parts
+        if youtube_parts and len(youtube_parts) > 0:
+            message_parts.extend(youtube_parts)
+
+        # Add the text query
+        message_parts.append(query)
+
+        # Send message with all parts
+        if len(message_parts) <= 1:  # Just the query
+            response = await asyncio.to_thread(chat.send_message, query)
+        else:
+            response = await asyncio.to_thread(chat.send_message, message_parts)
+
+        # Extract text from response
+        text_parts = [
+            part.text
+            for part in response.candidates[0].content.parts
+            if part.text is not None
+        ]
+        response_text = "".join(text_parts)
+
+        # Update history with the latest query and response
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": response_text})
+
+        # Keep only the last `history_limit` messages
+        if len(history) > history_limit:
+            prime_history[author_id]["history"] = history[-history_limit:]
+
+        if response.function_calls and len(response.function_calls) > 0:
+            func_response_parts = []
+            for func_call in response.function_calls:
+                if func_call.name == "google_search":
+                    args = func_call.args
+                    search_query = args.get("query", "")
+                    function_response = await google_search(search_query)
+                    if function_response is None:
+                        function_response = "Error performing internet search."
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="google_search",
+                            response={"content": function_response}
+                        )
+                    )
+                elif func_call.name == "search_youtube_videos":
+                    args = func_call.args
+                    search_query = args.get("query", "")
+                    max_res = args.get("max_results", 3)
+                    function_response = await search_youtube_videos(search_query, max_res)
+                    if function_response is None:
+                        function_response = "Error performing YouTube search."
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="search_youtube_videos",
+                            response={"content": function_response}
+                        )
+                    )
+                else:
+                    continue
+            response = await asyncio.to_thread(chat.send_message, func_response_parts)
+            text_parts = [
+                part.text
+                for part in response.candidates[0].content.parts
+                if part.text is not None
+            ]
+            response_text = "".join(text_parts)
+            history.append({"role": "assistant", "content": response_text})
+        return response_text
+
+    except Exception as ex:
+        print(f"Unhandled exception in Prime Function: {ex}")
+        return "An error occurred, try again later or join our support server."
+
+
+bot 2:
+
+here also similar
+
+
+google_search_decl = FunctionDeclaration(
+    name="google_search",
+    description="Search the web using Google Search API to get real-time information from the internet.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query for Google search to find real-time information from the internet. This query should reflect what the user is asking for.",
+            }
+        },
+        "required": ["query"],
+    },
+)
+google_search_tool = Tool(function_declarations=[google_search_decl])
+
+server_info_decl = FunctionDeclaration(
+    name="server_info",
+    description="Retrieve current server details including guild name, guild ID, owner ID, admins, roles, categories, text channels, and voice channels.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "dummy": {
+                "type": "string",
+                "description": "Not used, for compatibility purposes.",
+            }
+        },
+        "required": [],
+    },
+)
+server_info_tool = Tool(function_declarations=[server_info_decl])
+
+retrieve_context_decl = FunctionDeclaration(
+    name="retrieve_context",
+    description=(
+        "Retrieve relevant context from the unified document corpus covering key project documents "
+        "(e.g., whitepaper, roadmap, viral marketing strategy, and lore) using RAG. "
+        "This function embeds the query, searches the FAISS index for the most similar text chunks, "
+        "and returns the relevant snippet text to inform answers on project-specific questions."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "User query for context retrieval."},
+            "category": {"type": "string", "description": "Optional: filter chunks by a specific category (e.g., 'whitepaper', 'roadmap', 'marketing', or 'lore')."},
+        },
+        "required": ["query"],
+    },
+)
+retrieve_context_tool = Tool(function_declarations=[retrieve_context_decl])
+
+
+tools = [server_info_tool, google_search_tool, retrieve_context_tool]
+
+async def google_search(query: str) -> str:
+    """
+    Uses Gemini's native Google Search tool to get real-time information.
+    This function is separate from our main chat system and only returns search results.
+    """
+    try:
+        # Create a specific system instruction for the search-only model
+        search_system_prompt = """
+        You are a search tool that provides real time information from the web.
+        - Return ONLY the real time information you find through search
+        - Do NOT add any introductory phrases like "Here's what I found" or "According to my search"
+        - Do NOT add any conclusions or summaries
+        - Format the information in a clear, concise manner
+        - Include relevant dates, numbers, and facts from your search
+        - If you cannot find information, simply state "No relevant information found"
+        """
+        
+        # Use the native Google Search tool
+        google_search_tool = Tool(google_search=GoogleSearch())
+        
+        # Generate content with the search tool
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.0-flash",
+            contents=f"Search query: {query}",
+            config=GenerateContentConfig(
+                system_instruction=search_system_prompt,
+                tools=[google_search_tool],
+                temperature=0.1,  
+                safety_settings=safety_settings,
+            )
+        )
+        
+        # Extract the text from the response
+        text_parts = [part.text for part in response.candidates[0].content.parts if part.text]
+        search_result = "".join(text_parts)
+        
+        return search_result.strip()
+    
+    except Exception as e:
+        logger.error(f"Error in native Google search: {e}")
+        return "Error performing internet search. Please try again later."
+
+def get_server_info() -> dict:
+    """
+    Retrieve current server details using a static guild id.
+    Uses the global bot variable to get the guild from the bot's cache.
+    """
+    guild = bot.get_guild(int(STATIC_GUILD_ID))
+    if guild is None:
+        return {"error": "Guild not found."}
+
+    owner_id = str(guild.owner_id)
+    admins = [
+        str(member.id)
+        for member in guild.members
+        if member.guild_permissions.administrator
+    ]
+    roles = [role.name for role in guild.roles if role.name != "@everyone"]
+    categories = [category.name for category in guild.categories]
+
+    text_channels = []
+    for category in guild.categories:
+        for channel in category.text_channels:
+            text_channels.append(
+                {
+                    "channel_id": str(channel.id),
+                    "channel_name": channel.name,
+                    "topic": channel.topic or "",
+                }
+            )
+
+    voice_channels = []
+    for channel in guild.voice_channels:
+        voice_channels.append(
+            {"channel_id": str(channel.id), "channel_name": channel.name}
+        )
+
+    return {
+        "guild_name": guild.name,
+        "guild_id": str(guild.id),
+        "owner_id": owner_id,
+        "admins": admins,
+        "num_roles": len(roles),
+        "roles": roles,
+        "num_categories": len(categories),
+        "categories": categories,
+        "text_channels": text_channels,
+        "voice_channels": voice_channels,
+    }
+
+def retrieve_context(query: str, index: faiss.Index, chunks: dict, top_k: int = 3, filter_category: str = None) -> str:
+    """
+    Given a query, embeds it, searches the FAISS index for the top_k most similar chunks,
+    and returns a concatenated context string. Optionally filters by category.
+    """
+    if index is None:
+        return "Information is currently unavailable. The knowledge base has not been initialized."
+    
+    try:
+        query_emb = embed_query(query)
+        distances, indices = index.search(query_emb, top_k)
+        
+        retrieved_texts = []
+        for idx in indices[0]:
+            # Convert NumPy int64 to Python int for dictionary access
+            idx_int = int(idx)
+            
+            # Check if we're working with a list
+            if isinstance(chunks, list):
+                if idx_int < len(chunks):
+                    chunk = chunks[idx_int]
+                    
+                    # If filtering by category, check before adding
+                    if filter_category:
+                        chunk_category = chunk.get("category", chunk.get("source", None))
+                        if chunk_category == filter_category:
+                            retrieved_texts.append(chunk["text"])
+                    else:
+                        retrieved_texts.append(chunk["text"])
+            
+            # Check if we're working with a dictionary
+            elif isinstance(chunks, dict):
+                # For dictionary-based chunks, we need to access by key
+                chunk_keys = list(chunks.keys())
+                if idx_int < len(chunk_keys):
+                    chunk_key = chunk_keys[idx_int]
+                    chunk = chunks[chunk_key]
+                    
+                    # If filtering by category, check before adding
+                    if filter_category:
+                        chunk_category = chunk.get("category", chunk.get("source", None))
+                        if chunk_category == filter_category:
+                            retrieved_texts.append(chunk["text"])
+                    else:
+                        retrieved_texts.append(chunk["text"])
+        
+        if not retrieved_texts:
+            return "I couldn't find specific information about that in my knowledge base."
+        
+        return "\n\n".join(retrieved_texts)
+    
+    except Exception as e:
+        print(f"Error in retrieve_context: {e}")
+        return "Information retrieval failed. Please try again later."
+
+# Asynchronous wrapper for function calling.
+async def get_retrieved_context(args: dict, index: faiss.Index, chunks: list) -> str:
+    query = args.get("query", "")
+    # Optionally, you could read a "category" key from args and pass to retrieve_context.
+    filter_category = args.get("category", None)
+    context = retrieve_context(query, index, chunks, top_k=3, filter_category=filter_category)
+    return context
+
+
+async def generate_response_prime(author_id, query, index: faiss.Index, chunks: list) -> str:
+    author_id = str(author_id)
+    max_tokens = 5000
+    history_limit = 50
+    model_name = "gemini-2.0-flash"
+
+    if author_id not in prime_history:
+        prime_history[author_id] = {
+            "chat": client.chats.create(
+                model=model_name,
+                config=GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=tools,
+                    temperature=0.5,
+                    max_output_tokens=max_tokens,
+                    safety_settings=safety_settings,
+                ),
+            ),
+            "history": [],
+        }
+    chat = prime_history[author_id]["chat"]
+    history = prime_history[author_id]["history"]
+
+    try:
+        # Send the user query.
+        response = await asyncio.to_thread(chat.send_message, query)
+        text_parts = [part.text for part in response.candidates[0].content.parts if part.text]
+        response_text = "".join(text_parts)
+
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": response_text})
+        if len(history) > history_limit:
+            prime_history[author_id]["history"] = history[-history_limit:]
+        usage = response.usage_metadata
+        update_token_usage(author_id, usage.prompt_token_count, usage.candidates_token_count)
+
+        # Process any function calls returned by Gemini.
+        if response.function_calls and len(response.function_calls) > 0:
+            func_response_parts = []
+            for func_call in response.function_calls:
+                if func_call.name == "server_info":
+                    function_response = get_server_info()
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="server_info",
+                            response={"content": json.dumps(function_response)}
+                        )
+                    )
+                elif func_call.name == "google_search":
+                    args = func_call.args
+                    search_query = args.get("query", "")
+                    function_response = await google_search(search_query)
+                    if function_response is None:
+                        function_response = "Error in performing Google search."
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="google_search",
+                            response={"content": function_response}
+                        )
+                    )
+                elif func_call.name == "retrieve_context":
+                    args = func_call.args
+                    context_result = await get_retrieved_context(args, index, chunks)
+                    func_response_parts.append(
+                        Part.from_function_response(
+                            name="retrieve_context",
+                            response={"content": context_result}
+                        )
+                    )
+                else:
+                    continue
+
+            # Send function responses back to the chat.
+            response = await asyncio.to_thread(chat.send_message, func_response_parts)
+            text_parts = [part.text for part in response.candidates[0].content.parts if part.text]
+            response_text = "".join(text_parts)
+            history.append({"role": "assistant", "content": response_text})
+        
+        return response_text
+
+    except Exception as ex:
+        print(f"Unhandled exception: {ex}")
+        return "An error occurred. Please try again later or contact support."
+
+
+bot 3:
+
+# --- Function Declaration: check_riddle_data_decl ---
+check_riddle_data_decl = FunctionDeclaration(
+    name="check_riddle_data",
+    description="Retrieve the history of previous riddles, including their questions, difficulty, winners, and timestamps.",
+    parameters={
+        "type": "object",
+        "properties": {
+            # Add a dummy property to satisfy the API schema
+            "unused": {
+                "type": "string",
+                "description": "This parameter is not used by the function but required by the API schema.",
+            }
+        },
+        # Since the dummy parameter isn't actually needed, keep 'required' empty or omit it
+        "required": [],
+    },
+)
+
+# --- Existing Function Declaration (for context) ---
+save_riddle_data_decl = FunctionDeclaration(
+    name="save_riddle_data",
+    description="Save the data for a completed riddle, including the question, difficulty mode, and winner (or 'none' if aborted).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "riddle_question": {
+                "type": "string",
+                "description": "The actual riddle question.",
+            },
+            "difficulty_mode": {
+                "type": "string",
+                "description": "Difficulty mode (Easy, Medium, Hard).",
+            },
+            "winner": {
+                "type": "string",
+                "description": "User ID of the correct answerer, or 'none' if aborted.",
+            },
+        },
+        "required": ["riddle_question", "difficulty_mode", "winner"],
+    },
+)
+
+# --- Updated Tool with BOTH functions ---
+# Now include both declarations in the Tool
+riddle_tool = Tool(
+    function_declarations=[
+        save_riddle_data_decl,
+        check_riddle_data_decl,
+    ]
+)
+
+
+# --- Existing save_riddle_data function (Unchanged, provided for completeness) ---
+def save_riddle_data(riddle_question: str, difficulty_mode: str, winner: str) -> dict:
+    """
+    Save the riddle data by appending it to a JSON file.
+    """
+    data_entry = {
+        "riddle_question": riddle_question,
+        "difficulty_mode": difficulty_mode,
+        "winner": winner,
+        "timestamp": datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S"),
+    }
+    file_path = "data/riddle_data.json"
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    existing_data = []
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+                if content:  # Check if file is not empty
+                    existing_data = json.loads(content)
+                    if not isinstance(existing_data, list):
+                        print(
+                            f"Warning: {file_path} did not contain a list. Overwriting with new list."
+                        )
+                        existing_data = []
+                # If file is empty, existing_data remains []
+        except json.JSONDecodeError:
+            print(
+                f"Warning: Could not decode JSON from {file_path}. Starting with an empty list."
+            )
+            existing_data = []  # File is corrupted or not valid JSON
+    # Append the new entry
+    existing_data.append(data_entry)
+
+    # Write the updated list back to the file
+    try:
+        with open(file_path, "w") as f:
+            json.dump(existing_data, f, indent=4)
+    except Exception as e:
+        print(f"Error writing to {file_path}: {e}")
+        return {"error": f"Failed to save data: {e}"}
+
+    return data_entry
+
+
+# --- Mapping function names to actual functions ---
+# This dictionary helps call the correct Python function based on the name Gemini provides
+available_functions = {
+    "save_riddle_data": save_riddle_data,
+    "check_riddle_data": check_riddle_data,
+}
+
+
+async def generate_response_server(
+    bot: commands.Bot, server_id: str, user_id: str, query: str
+) -> str:
+    global server_history, client
+
+    max_retries = 3
+    retry_delay = 2
+
+    if server_id not in server_history:
+        # Initialization logic - create a new chat for this server.
+        print("Initializing chat for server:", server_id)
+        server_history[server_id] = {
+            "chat": client.chats.create(
+                model="gemini-2.0-flash",  # Or your preferred model
+                config=GenerateContentConfig(
+                    system_instruction=RIDDLE_HUNT_PROMPT,
+                    temperature=0.5,
+                    max_output_tokens=800,
+                    tools=[riddle_tool],  # Use the updated riddle_tool
+                    safety_settings=safety_settings,
+                ),
+            ),
+            "history": [],
+        }
+    chat = server_history[server_id]["chat"]
+    history = server_history[server_id]["history"]
+
+    user_message = f"{user_id}: {query}"
+    print(f"Sending message to Gemini for server {server_id}: {user_message}")
+
+    for attempt in range(max_retries):
+        try:
+            response = await asyncio.to_thread(chat.send_message,
+            user_message)
+            break
+        except Exception as e_gemini:
+            print(f"Error During Gemini API call (attempt {attempt+1}/{max_retries}): {e_gemini}")
+            if attempt < max_retries -1:
+                print(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+
+            else:
+                print(f"All {max_retries} attempts failed when communicating with Gemini API")
+                return ""
+            
+
+    # --- Handle potential function calls ---
+    if response.function_calls and len(response.function_calls) > 0:
+        print(f"Gemini requested {len(response.function_calls)} function calls.")
+        function_response_parts = []
+
+        for func_call in response.function_calls:
+            function_name = func_call.name
+            args = func_call.args
+            print(f"Executing function call: {function_name} with args: {args}")
+
+            if function_name in available_functions:
+                function_to_call = available_functions[function_name]
+                try:
+                    # Run synchronous function in a separate thread.
+                    result = await asyncio.to_thread(function_to_call, **args)
+                    print(f"Function {function_name} executed. Result: {result}")
+
+                    # <<< --- START: MODIFIED REWARD TRIGGER LOGIC --- >>>
+                    if function_name == "save_riddle_data":
+                        is_success = isinstance(result, dict) and "error" not in result
+                        winner_id_str = args.get("winner")
+                        if is_success and winner_id_str and winner_id_str != "none":
+                            print(
+                                f"Successful save_riddle_data for winner {winner_id_str}. Triggering rewards..."
+                            )
+                            difficulty = args.get("difficulty_mode", "default")
+                            try:
+                                guild = bot.get_guild(int(server_id))
+                                member = (
+                                    await guild.fetch_member(int(winner_id_str))
+                                    if guild
+                                    else None
+                                )
+                                if member and guild:
+                                    xp_to_add = XP_VALUES.get(
+                                        difficulty, XP_VALUES["default"]
+                                    )
+                                    asyncio.create_task(
+                                        add_xp_riddle(winner_id_str, xp_to_add)
+                                    )
+                                    print(
+                                        f"XP add task created for {winner_id_str} (+{xp_to_add} XP)."
+                                    )
+                                    asyncio.create_task(
+                                        check_and_award_role(member, guild)
+                                    )
+                                    print(
+                                        f"Role check task created for {member.display_name}."
+                                    )
+                                else:
+                                    if not guild:
+                                        print(
+                                            f"Reward Warning: Could not find guild {server_id}."
+                                        )
+                                    if guild and not member:
+                                        print(
+                                            f"Reward Warning: Could not find member {winner_id_str} in guild {guild.name}."
+                                        )
+                            except ValueError:
+                                print(
+                                    f"Reward Error: Invalid winner ID '{winner_id_str}'."
+                                )
+                            except discord.NotFound:
+                                print(
+                                    f"Reward Warning: Member {winner_id_str} not found in guild {server_id} via fetch_member."
+                                )
+                            except discord.Forbidden:
+                                print(
+                                    f"Reward Error: Bot lacks permission to fetch member {winner_id_str} in guild {server_id}."
+                                )
+                            except Exception as e_reward:
+                                print(
+                                    f"Reward Error: Unexpected issue during reward processing for {winner_id_str}: {e_reward}"
+                                )
+                    # <<< --- END: MODIFIED REWARD TRIGGER LOGIC --- >>>
+
+                    # Append the function result.
+                    function_response_parts.append(
+                        Part.from_function_response(
+                            name=function_name, response={"content": result}
+                        )
+                    )
+                except Exception as e_call:
+                    print(
+                        f"Error executing function {function_name} via thread: {e_call}"
+                    )
+                    function_response_parts.append(
+                        Part.from_function_response(
+                            name=function_name,
+                            response={"error": f"Execution failed: {e_call}"},
+                        )
+                    )
+            else:
+                print(
+                    f"Warning: Model requested unknown function '{function_name}'. Skipping."
+                )
+                function_response_parts.append(
+                    Part.from_function_response(
+                        name=function_name,
+                        response={"error": f"Function '{function_name}' not found."},
+                    )
+                )
+
+        # Send all collected function results back to the AI.
+        if function_response_parts:
+            print(
+                f"Sending {len(function_response_parts)} function responses back to Gemini."
+            )
+            retry_delay = 2
+            for attempt in range(max_retries):
+                try:
+                    response = await asyncio.to_thread(
+                        chat.send_message, function_response_parts
+                    )
+                    break
+                except Exception as e_gemini_resend:
+                    print(f"Error sending fucntion responses back to Gemini (attempt {attempt+1}/{max_retries}) : {e_gemini_resend}")
+                    if attempt < max_retries -1:
+                        print(f"Retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"All {max_retries} attempts failed when sending fuction responses")
+                        return ""
+        else:
+            print("No valid function calls executed or responses generated.")
+
+    # --- Extract final text response ---
+    try:
+        response_text = "".join(
+            [
+                part.text
+                for part in response.candidates[0].content.parts
+                if hasattr(part, "text")
+            ]
+        )
+    except Exception as e_extract:
+        print(f"Error extracting final text response: {e_extract}")
+        return ""
+
+    # --- Update history ---
+    history.append({"role": "user", "content": user_message})
+    if response_text:
+        history.append({"role": "assistant", "content": response_text})
+    if len(history) > 100:
+        print(f"Pruning history for server {server_id}. Current length: {len(history)}")
+        server_history[server_id]["history"] = history[-100:]
+    print(f"Server {server_id} history updated. New length: {len(history)}")
+    return response_text
+
+
+and last here are some imports and SDK information:
+
+pip install google-genai
+
+imports that are required for this:
+
+from google import genai
+from google.genai.types import (
+    Tool,
+    GenerateContentConfig,
+    GoogleSearch,
+    Part,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+    FunctionDeclaration,
+)
+
+
+I guess it is enough for you to understand each and everything, right?

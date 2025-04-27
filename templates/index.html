@@ -1,0 +1,50 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Video Editor</title>
+    <link rel="stylesheet" href="{% static 'css/style.css' %}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>AI Video Editor</h1>
+            <p>Describe the edits you want, upload your media, and let the AI handle the rest!</p>
+        </header>
+
+        <main>
+            <form id="edit-form" method="post" enctype="multipart/form-data">
+                {% csrf_token %} {# Important for Django forms #}
+
+                <div class="prompt-section">
+                    <label for="prompt">Your Editing Instructions:</label>
+                    <textarea id="prompt" name="prompt" rows="5" placeholder="e.g., 'Add a 'beep' sound over abusive words', 'Add cinematic background music', 'Cut the first 5 seconds'..." required></textarea>
+                </div>
+
+                <div class="upload-section">
+                    <label for="media-upload">Upload Video/Audio/Image:</label>
+                    <input type="file" id="media-upload" name="media_file" accept="video/*,audio/*,image/*">
+                    <!-- Add 'multiple' attribute if you want to allow multiple file uploads -->
+                </div>
+
+                <button type="submit" class="submit-btn">Start Editing</button>
+            </form>
+
+            <div class="output-section" style="display: none;"> {# Hidden initially #}
+                <h2>Result:</h2>
+                <div id="result-content">
+                    <!-- AI response or link to edited video will appear here -->
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>&copy; 2024 Your AI Editor</p>
+        </footer>
+    </div>
+
+    {# Optional: Link to JavaScript file for animations/interactions #}
+    {# <script src="{% static 'js/script.js' %}"></script> #}
+</body>
+</html>
